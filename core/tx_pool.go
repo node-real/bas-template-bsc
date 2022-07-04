@@ -17,10 +17,17 @@
 package core
 
 import (
+	"context"
 	"errors"
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/common/systemcontract"
+	"github.com/ethereum/go-ethereum/internal/ethapi"
+	"github.com/ethereum/go-ethereum/rpc"
 	"math"
 	"math/big"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -158,6 +165,10 @@ type TxPoolConfig struct {
 
 	Lifetime       time.Duration // Maximum amount of time non-executable transaction are queued
 	ReannounceTime time.Duration // Duration for announcing local pending transactions again
+
+	// TODO add config
+	TxFCFS bool // tx first come, first served
+
 }
 
 // DefaultTxPoolConfig contains the default configurations for the transaction
@@ -176,6 +187,8 @@ var DefaultTxPoolConfig = TxPoolConfig{
 
 	Lifetime:       3 * time.Hour,
 	ReannounceTime: 10 * 365 * 24 * time.Hour,
+	// TODO default value
+	TxFCFS: true,
 }
 
 // sanitize checks the provided user configurations and changes anything that's
@@ -249,6 +262,10 @@ type TxPool struct {
 	locals  *accountSet // Set of local transaction to exempt from eviction rules
 	journal *txJournal  // Journal of local transaction to back up to disk
 
+	// TODO add gasFreeToAddressMap
+	gasFreeToAddressMap map[common.Address]int // Contract addresses called that can join tx_pool for free
+	ethAPI              *ethapi.PublicBlockChainAPI
+
 	pending map[common.Address]*txList   // All currently processable transactions
 	queue   map[common.Address]*txList   // Queued but non-processable transactions
 	beats   map[common.Address]time.Time // Last heartbeat from each known account
@@ -271,7 +288,7 @@ type txpoolResetRequest struct {
 
 // NewTxPool creates a new transaction pool to gather, sort and filter inbound
 // transactions from the network.
-func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain blockChain) *TxPool {
+func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain blockChain, ee *ethapi.PublicBlockChainAPI) *TxPool {
 	// Sanitize the input to ensure no vulnerable gas prices are set
 	config = (&config).sanitize()
 
@@ -291,7 +308,11 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 		queueTxEventCh:  make(chan *types.Transaction),
 		reorgDoneCh:     make(chan chan struct{}),
 		reorgShutdownCh: make(chan struct{}),
-		gasPrice:        new(big.Int).SetUint64(config.PriceLimit),
+		// TODO set min price
+		gasPrice: new(big.Int).SetUint64(config.PriceLimit),
+		// TODO add ethapi
+		ethAPI:              ee,
+		gasFreeToAddressMap: make(map[common.Address]int),
 	}
 	pool.locals = newAccountSet(pool.signer)
 	for _, addr := range config.Locals {
@@ -592,7 +613,9 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 		return ErrInvalidSender
 	}
 	// Drop non-local transactions under our own minimal accepted gas price
-	if !local && tx.GasPriceIntCmp(pool.gasPrice) < 0 {
+	// TODO gasFreeToAddressMap
+	_, exist := pool.gasFreeToAddressMap[*tx.To()]
+	if !local && !exist && tx.GasPriceIntCmp(pool.gasPrice) < 0 {
 		return ErrUnderpriced
 	}
 	// Ensure the transaction adheres to nonce ordering
@@ -643,6 +666,10 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 	// If the transaction pool is full, discard underpriced transactions
 	if uint64(pool.all.Count()+numSlots(tx)) > pool.config.GlobalSlots+pool.config.GlobalQueue {
 		// If the new transaction is underpriced, don't accept it
+		// TODO if pool is full
+		if !isLocal && pool.config.TxFCFS {
+			return false, ErrTxPoolOverflow
+		}
 		if !isLocal && pool.priced.Underpriced(tx) {
 			//log.Trace("Discarding underpriced transaction", "hash", hash, "price", tx.GasPrice())
 			underpricedTxMeter.Mark(1)
@@ -1242,6 +1269,14 @@ func (pool *TxPool) reset(oldHead, newHead *types.Header) {
 	pool.pendingNonces = newTxNoncer(statedb)
 	pool.currentMaxGas = newHead.GasLimit
 
+	// TODO set gasFreeToAddressMap
+	gasFreeToAddressMap, err := getCurrentgasFreeToAddressMap(pool.chain.CurrentBlock().Hash(), pool.ethAPI)
+	if err != nil {
+		log.Warn("Failed to get gasFreeAddress", "err", err)
+	} else {
+		pool.gasFreeToAddressMap = gasFreeToAddressMap
+	}
+
 	// Inject any transactions discarded due to reorgs
 	log.Debug("Reinjecting stale transactions", "count", len(reinject))
 	senderCacher.recover(pool.signer, reinject)
@@ -1758,4 +1793,50 @@ func (t *txLookup) RemoteToLocals(locals *accountSet) int {
 // numSlots calculates the number of slots needed for a single transaction.
 func numSlots(tx *types.Transaction) int {
 	return int((tx.Size() + txSlotSize - 1) / txSlotSize)
+}
+
+// getCurrentgasFreeToAddressMap get current gasFreeToAddressMap
+func getCurrentgasFreeToAddressMap(blockHash common.Hash, ee *ethapi.PublicBlockChainAPI) (map[common.Address]int, error) {
+	// block
+	blockNr := rpc.BlockNumberOrHashWithHash(blockHash, false)
+
+	// method
+	method := "getFreeGasToAddressList"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // cancel when we are finished consuming integers
+
+	gasFreeToAddressABI, err := abi.JSON(strings.NewReader(gasFreeToAddressABI))
+	data, err := gasFreeToAddressABI.Pack(method)
+	if err != nil {
+		log.Error("Unable to pack tx for getFreeGasAddress", "error", err)
+		return nil, err
+	}
+	// call
+	msgData := (hexutil.Bytes)(data)
+	toAddress := common.HexToAddress(systemcontract.ChainConfigContract)
+	gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
+	result, err := ee.Call(ctx, ethapi.CallArgs{
+		Gas:  &gas,
+		To:   &toAddress,
+		Data: &msgData,
+	}, blockNr, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		ret0 = new([]common.Address)
+	)
+	out := ret0
+
+	if err := gasFreeToAddressABI.UnpackIntoInterface(out, method, result); err != nil {
+		return nil, err
+	}
+
+	gasFreeToAddressMap := make(map[common.Address]int, len(*ret0))
+	for i, a := range *ret0 {
+		gasFreeToAddressMap[a] = i
+	}
+	return gasFreeToAddressMap, nil
 }
