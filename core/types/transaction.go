@@ -402,11 +402,12 @@ func (s TxByPriceAndTime) Len() int { return len(s) }
 func (s TxByPriceAndTime) Less(i, j int) bool {
 	// If the prices are equal, use the time the transaction was first seen for
 	// deterministic sorting
-	cmp := s[i].ImmutableGasPrice().Cmp(s[j].ImmutableGasPrice())
-	if cmp == 0 {
-		return s[i].time.Before(s[j].time)
-	}
-	return cmp > 0
+	// TODO add config
+	//cmp := s[i].ImmutableGasPrice().Cmp(s[j].ImmutableGasPrice())
+	//if cmp == 0 {
+	return s[i].time.Before(s[j].time)
+	//}
+	//return cmp > 0
 }
 func (s TxByPriceAndTime) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 
