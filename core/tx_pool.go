@@ -17,17 +17,10 @@
 package core
 
 import (
-	"context"
 	"errors"
-	"github.com/ethereum/go-ethereum/accounts/abi"
-	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/ethereum/go-ethereum/common/systemcontract"
-	"github.com/ethereum/go-ethereum/internal/ethapi"
-	"github.com/ethereum/go-ethereum/rpc"
 	"math"
 	"math/big"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -263,8 +256,8 @@ type TxPool struct {
 	journal *txJournal  // Journal of local transaction to back up to disk
 
 	// TODO add gasFreeToAddressMap
-	gasFreeToAddressMap map[common.Address]int // Contract addresses called that can join tx_pool for free
-	ethAPI              *ethapi.PublicBlockChainAPI
+	gasFreeToAddressMap     map[common.Address]int                            // Contract addresses called that can join tx_pool for free
+	gasFreeToAddressMapFunc func(common.Hash) (map[common.Address]int, error) // add func to get gasFreeToAddressMap
 
 	pending map[common.Address]*txList   // All currently processable transactions
 	queue   map[common.Address]*txList   // Queued but non-processable transactions
@@ -288,7 +281,7 @@ type txpoolResetRequest struct {
 
 // NewTxPool creates a new transaction pool to gather, sort and filter inbound
 // transactions from the network.
-func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain blockChain, ee *ethapi.PublicBlockChainAPI) *TxPool {
+func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain blockChain, gasFreeToAddressMapFunc func(common.Hash) (map[common.Address]int, error)) *TxPool {
 	// Sanitize the input to ensure no vulnerable gas prices are set
 	config = (&config).sanitize()
 
@@ -309,10 +302,9 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 		reorgDoneCh:     make(chan chan struct{}),
 		reorgShutdownCh: make(chan struct{}),
 		// TODO set min price
-		gasPrice: new(big.Int).SetUint64(config.PriceLimit),
-		// TODO add ethapi
-		ethAPI:              ee,
-		gasFreeToAddressMap: make(map[common.Address]int),
+		gasPrice:                new(big.Int).SetUint64(config.PriceLimit),
+		gasFreeToAddressMap:     make(map[common.Address]int),
+		gasFreeToAddressMapFunc: gasFreeToAddressMapFunc,
 	}
 	pool.locals = newAccountSet(pool.signer)
 	for _, addr := range config.Locals {
@@ -1270,7 +1262,7 @@ func (pool *TxPool) reset(oldHead, newHead *types.Header) {
 	pool.currentMaxGas = newHead.GasLimit
 
 	// TODO set gasFreeToAddressMap
-	gasFreeToAddressMap, err := getCurrentgasFreeToAddressMap(pool.chain.CurrentBlock().Hash(), pool.ethAPI)
+	gasFreeToAddressMap, err := pool.gasFreeToAddressMapFunc(pool.chain.CurrentBlock().Hash())
 	if err != nil {
 		log.Warn("Failed to get gasFreeAddress", "err", err)
 	} else {
@@ -1793,50 +1785,4 @@ func (t *txLookup) RemoteToLocals(locals *accountSet) int {
 // numSlots calculates the number of slots needed for a single transaction.
 func numSlots(tx *types.Transaction) int {
 	return int((tx.Size() + txSlotSize - 1) / txSlotSize)
-}
-
-// getCurrentgasFreeToAddressMap get current gasFreeToAddressMap
-func getCurrentgasFreeToAddressMap(blockHash common.Hash, ee *ethapi.PublicBlockChainAPI) (map[common.Address]int, error) {
-	// block
-	blockNr := rpc.BlockNumberOrHashWithHash(blockHash, false)
-
-	// method
-	method := "getFreeGasToAddressList"
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // cancel when we are finished consuming integers
-
-	gasFreeToAddressABI, err := abi.JSON(strings.NewReader(gasFreeToAddressABI))
-	data, err := gasFreeToAddressABI.Pack(method)
-	if err != nil {
-		log.Error("Unable to pack tx for getFreeGasAddress", "error", err)
-		return nil, err
-	}
-	// call
-	msgData := (hexutil.Bytes)(data)
-	toAddress := common.HexToAddress(systemcontract.ChainConfigContract)
-	gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
-	result, err := ee.Call(ctx, ethapi.CallArgs{
-		Gas:  &gas,
-		To:   &toAddress,
-		Data: &msgData,
-	}, blockNr, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	var (
-		ret0 = new([]common.Address)
-	)
-	out := ret0
-
-	if err := gasFreeToAddressABI.UnpackIntoInterface(out, method, result); err != nil {
-		return nil, err
-	}
-
-	gasFreeToAddressMap := make(map[common.Address]int, len(*ret0))
-	for i, a := range *ret0 {
-		gasFreeToAddressMap[a] = i
-	}
-	return gasFreeToAddressMap, nil
 }
