@@ -18,10 +18,15 @@
 package eth
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/ethereum/go-ethereum/common/systemcontract"
 	"math/big"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -221,7 +226,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		config.TxPool.Journal = stack.ResolvePath(config.TxPool.Journal)
 	}
 	// TODO add ethapi
-	eth.txPool = core.NewTxPool(config.TxPool, chainConfig, eth.blockchain, ethAPI)
+	eth.txPool = core.NewTxPool(config.TxPool, chainConfig, eth.blockchain, getCurrentgasFreeToAddressMap(ethAPI))
 
 	// Permit the downloader to use the trie cache allowance during fast sync
 	cacheLimit := cacheConfig.TrieCleanLimit + cacheConfig.TrieDirtyLimit + cacheConfig.SnapshotLimit
@@ -594,4 +599,52 @@ func (s *Ethereum) Stop() error {
 	s.eventMux.Stop()
 
 	return nil
+}
+
+// getCurrentgasFreeToAddressMap get current gasFreeToAddressMap
+func getCurrentgasFreeToAddressMap(ee *ethapi.PublicBlockChainAPI) func(common.Hash) (map[common.Address]int, error) {
+	return func(blockHash common.Hash) (map[common.Address]int, error) {
+		// block
+		blockNr := rpc.BlockNumberOrHashWithHash(blockHash, false)
+
+		// method
+		method := "getFreeGasToAddressList"
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel() // cancel when we are finished consuming integers
+
+		gasFreeToAddressABI, err := abi.JSON(strings.NewReader(gasFreeToAddressABI))
+		data, err := gasFreeToAddressABI.Pack(method)
+		if err != nil {
+			log.Error("Unable to pack tx for getFreeGasAddress", "error", err)
+			return nil, err
+		}
+		// call
+		msgData := (hexutil.Bytes)(data)
+		toAddress := common.HexToAddress(systemcontract.ChainConfigContract)
+		gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
+		result, err := ee.Call(ctx, ethapi.CallArgs{
+			Gas:  &gas,
+			To:   &toAddress,
+			Data: &msgData,
+		}, blockNr, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		var (
+			ret0 = new([]common.Address)
+		)
+		out := ret0
+
+		if err := gasFreeToAddressABI.UnpackIntoInterface(out, method, result); err != nil {
+			return nil, err
+		}
+
+		gasFreeToAddressMap := make(map[common.Address]int, len(*ret0))
+		for i, a := range *ret0 {
+			gasFreeToAddressMap[a] = i
+		}
+		return gasFreeToAddressMap, nil
+	}
 }
